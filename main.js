@@ -17,8 +17,8 @@ try {
 
 // GI グリッドの解像度（CSS ピクセル比）。?res= で固定しない限り、フレーム時間に合わせて自動で上下させる
 const FIXED_SCALE = Number(params.get('res')) || 0;
-const SCALE_MIN = 0.2, SCALE_MAX = 0.6;
-let scale = FIXED_SCALE || 0.4;
+const SCALE_MIN = 0.3, SCALE_MAX = 0.6;
+let scale = FIXED_SCALE || 0.5;
 const aspect = () => innerWidth / innerHeight;
 const resize = () => renderer.resize(innerWidth, innerHeight, scale);
 
@@ -40,9 +40,9 @@ let slowFrames = 0, fastFrames = 0;
 
 function adapt(dt) {
   if (FIXED_SCALE) return;
-  if (dt > 1 / 40) { slowFrames++; fastFrames = 0; }
+  if (dt > 1 / 30) { slowFrames++; fastFrames = 0; }
   else if (dt < 1 / 55) { fastFrames++; slowFrames = 0; }
-  if (slowFrames > 20 && scale > SCALE_MIN) { scale = Math.max(SCALE_MIN, scale * 0.8); slowFrames = 0; resize(); }
+  if (slowFrames > 30 && scale > SCALE_MIN) { scale = Math.max(SCALE_MIN, scale * 0.85); slowFrames = 0; resize(); }
   if (fastFrames > 120 && scale < SCALE_MAX) { scale = Math.min(SCALE_MAX, scale * 1.1); fastFrames = 0; resize(); }
 }
 

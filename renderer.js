@@ -41,36 +41,41 @@ vec4 lightAt(vec2 p){
 }
 `;
 
-const SCENE_SEGS = HEAD + LIGHTS + `
-uniform vec4 uSegs[MAX_SEGS];
-uniform int uNumSegs;
-uniform float uLineWidth;
+// 線（遮蔽物）は表示解像度のマスクとして持つ。GI グリッドの遮蔽物はこのマスクを縮小して作り、
+// 表示パスではこのマスクで線をまたぐ補間を切る
+const SD_SEG = `
 float sdSeg(vec2 p, vec2 a, vec2 b){
   vec2 pa = p - a, ba = b - a;
   float h = clamp(dot(pa, ba) / dot(ba, ba), 0., 1.);
   return length(pa - ba * h);
 }
+`;
+
+// uSegs は表示範囲を [0,1] とした座標
+const MASK_SEGS = HEAD + SD_SEG + `
+uniform vec4 uSegs[MAX_SEGS];
+uniform int uNumSegs;
+uniform vec2 uMaskSize;
+uniform float uLineWidth;
 void main(){
   vec2 p = gl_FragCoord.xy;
-  vec4 L = lightAt(p);
-  if (L.a > 0.) { o = L; return; }
   float d = 1e9;
   for (int i = 0; i < MAX_SEGS; i++) {
     if (i >= uNumSegs) break;
-    d = min(d, sdSeg(p, uSegs[i].xy, uSegs[i].zw));
+    d = min(d, sdSeg(p, uSegs[i].xy * uMaskSize, uSegs[i].zw * uMaskSize));
   }
-  o = vec4(0., 0., 0., d < uLineWidth ? 1. : 0.);
+  o = vec4(clamp(uLineWidth + .5 - d, 0., 1.), 0., 0., 1.);
 }`;
 
 // カメラの輝度を時間方向に平滑化して、エッジのちらつきを抑える
 const LUMA = HEAD + `
 uniform sampler2D uVideo;
 uniform sampler2D uPrev;
-uniform vec2 uView;
+uniform vec2 uMaskSize;
 uniform vec2 uCover;
 uniform float uBlend;
 void main(){
-  vec2 uv = gl_FragCoord.xy / uView;
+  vec2 uv = gl_FragCoord.xy / uMaskSize;
   vec2 v = (uv - .5) * uCover + .5;
   v.x = 1. - v.x;
   float l = dot(texture(uVideo, v).rgb, vec3(.299, .587, .114));
@@ -78,23 +83,38 @@ void main(){
   o = vec4(mix(prev, l, uBlend), 0., 0., 1.);
 }`;
 
-const SCENE_EDGES = HEAD + LIGHTS + `
+const MASK_EDGES = HEAD + `
 uniform sampler2D uLuma;
-uniform vec2 uView;
 uniform float uThresh;
-float lum(ivec2 p){ return texelFetch(uLuma, clamp(p, ivec2(0), ivec2(uView) - 1), 0).r; }
+float lum(ivec2 p){ return texelFetch(uLuma, clamp(p, ivec2(0), textureSize(uLuma, 0) - 1), 0).r; }
 void main(){
-  vec2 p = gl_FragCoord.xy;
-  vec4 L = lightAt(p);
-  if (L.a > 0.) { o = L; return; }
-  if (p.x > uView.x || p.y > uView.y) { o = vec4(0.); return; }
-  ivec2 q = ivec2(p);
+  ivec2 q = ivec2(gl_FragCoord.xy);
   float a = lum(q + ivec2(-1, 1)), b = lum(q + ivec2(0, 1)), c = lum(q + ivec2(1, 1));
   float d = lum(q + ivec2(-1, 0)), f = lum(q + ivec2(1, 0));
   float g = lum(q + ivec2(-1, -1)), h = lum(q + ivec2(0, -1)), k = lum(q + ivec2(1, -1));
   float gx = c + 2. * f + k - a - 2. * d - g;
   float gy = a + 2. * b + c - g - 2. * h - k;
-  o = vec4(0., 0., 0., length(vec2(gx, gy)) > uThresh ? 1. : 0.);
+  float m = length(vec2(gx, gy));
+  o = vec4(smoothstep(uThresh * .8, uThresh * 1.25, m), 0., 0., 1.);
+}`;
+
+// グリッド 1 テクセルが覆うマスクの範囲に線が少しでもあれば遮蔽物にする（光漏れ防止のため保守的に太らせる）
+const SCENE = HEAD + LIGHTS + `
+uniform sampler2D uMask;
+uniform vec2 uView;
+void main(){
+  vec2 p = gl_FragCoord.xy;
+  vec4 L = lightAt(p);
+  if (L.a > 0.) { o = L; return; }
+  if (p.x > uView.x + 1. || p.y > uView.y + 1.) { o = vec4(0.); return; }
+  float m = 0.;
+  for (int y = 0; y < 3; y++) {
+    for (int x = 0; x < 3; x++) {
+      vec2 q = floor(p) + (vec2(x, y) + .5) / 3.;
+      m = max(m, texture(uMask, q / uView).r);
+    }
+  }
+  o = vec4(0., 0., 0., m > .3 ? 1. : 0.);
 }`;
 
 const JFA_SEED = HEAD + `
@@ -253,9 +273,11 @@ void main(){
   o = vec4(n > 0. ? acc / n : vec3(0.), 1.);
 }`;
 
+// 低解像度の照度を、線をまたがない近傍テクセルだけで補間して表示解像度へ拡大する
 const DISPLAY = HEAD + `
 uniform sampler2D uIrr;
 uniform sampler2D uScene;
+uniform sampler2D uMask;
 uniform vec2 uRes;
 uniform vec2 uView;
 uniform vec2 uGrid;
@@ -269,14 +291,40 @@ uniform int uNumLights;
 vec3 aces(vec3 x){ return clamp((x * (2.51 * x + .03)) / (x * (2.43 * x + .59) + .14), 0., 1.); }
 uint pcg(uint v){ uint s = v * 747796405u + 2891336453u; uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u; return (w >> 22u) ^ w; }
 
-void main(){
-  vec2 bt = gl_FragCoord.xy / uRes * uView;
-  vec2 tuv = bt / uGrid;
-  vec3 col = texture(uIrr, tuv).rgb * uExposure;
+bool occluderTexel(ivec2 t){
+  vec4 s = texelFetch(uScene, t, 0);
+  return s.a > .5 && dot(s.rgb, vec3(1.)) == 0.;
+}
 
-  vec4 sc = texture(uScene, tuv);
-  float occ = dot(sc.rgb, vec3(1.)) > 0. ? 0. : sc.a;
-  col *= 1. - uLineAlpha * occ;
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec2 bt = uv * uView;
+  float line = texture(uMask, uv).r;
+
+  vec2 g = bt - .5;
+  ivec2 g0 = ivec2(floor(g));
+  vec2 f = g - vec2(g0);
+  vec3 acc = vec3(0.);
+  float wsum = 0.;
+  for (int c = 0; c < 4; c++) {
+    ivec2 off = ivec2(c & 1, c >> 1);
+    ivec2 t = clamp(g0 + off, ivec2(0), ivec2(uGrid) - 1);
+    vec2 w2 = mix(1. - f, f, vec2(off));
+    float w = w2.x * w2.y + 1e-4;
+    if (occluderTexel(t)) continue;
+    vec2 tc = (vec2(t) + .5) / uView;
+    bool blocked = false;
+    for (int s = 1; s <= 4; s++) {
+      if (texture(uMask, mix(uv, tc, float(s) / 5.)).r > .5) { blocked = true; break; }
+    }
+    if (blocked) continue;
+    acc += texelFetch(uIrr, t, 0).rgb * w;
+    wsum += w;
+  }
+  vec3 E = wsum > 0. ? acc / wsum : texture(uIrr, bt / uGrid).rgb;
+
+  vec3 col = E * uExposure;
+  col *= 1. - uLineAlpha * line;
 
   for (int l = 0; l < MAX_LIGHTS; l++) {
     if (l >= uNumLights) break;
@@ -322,9 +370,10 @@ export function createRenderer(canvas) {
   }
 
   const P = {
-    sceneSegs: program(SCENE_SEGS),
+    maskSegs: program(MASK_SEGS),
     luma: program(LUMA),
-    sceneEdges: program(SCENE_EDGES),
+    maskEdges: program(MASK_EDGES),
+    scene: program(SCENE),
     jfaSeed: program(JFA_SEED),
     jfaStep: program(JFA_STEP),
     jfaDist: program(JFA_DIST),
@@ -334,10 +383,17 @@ export function createRenderer(canvas) {
   };
   gl.bindVertexArray(gl.createVertexArray());
 
-  function target(w, h, filter = gl.NEAREST) {
+  const FMT = {
+    rgba: [gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT],
+    // 段テクスチャは帯域が支配的なので、アルファ無しの 32bit 形式にする
+    rgb: [gl.R11F_G11F_B10F, gl.RGB, gl.HALF_FLOAT],
+    r: [gl.R16F, gl.RED, gl.HALF_FLOAT],
+    mask: [gl.R8, gl.RED, gl.UNSIGNED_BYTE],
+  };
+  function target(w, h, filter = gl.NEAREST, fmt = FMT.rgba) {
     const tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    gl.texImage2D(gl.TEXTURE_2D, 0, fmt[0], w, h, 0, fmt[1], fmt[2], null);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -377,8 +433,9 @@ export function createRenderer(canvas) {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
-  // view: 画面に対応するグリッドの範囲（テクセル）。grid: 2^段数 の倍数へ切り上げた全体
-  let view = [0, 0], grid = [0, 0], count = 1, aspect = 1;
+  // view: 画面に対応するグリッドの範囲（テクセル）。grid: 2^段数 の倍数へ切り上げた全体。
+  // mask: 線の表示解像度マスク（CSS ピクセル）
+  let view = [0, 0], grid = [0, 0], mask = [0, 0], count = 1, aspect = 1;
   let T = {};
 
   function resize(cssW, cssH, scale) {
@@ -386,6 +443,7 @@ export function createRenderer(canvas) {
     canvas.height = Math.floor(cssH * Math.min(devicePixelRatio || 1, 2));
     aspect = cssW / cssH;
     view = [Math.max(16, Math.round(cssW * scale)), Math.max(16, Math.round(cssH * scale))];
+    mask = [Math.round(cssW), Math.round(cssH)];
     // 最上段の区間の終端が対角線を超える段数
     const diag = Math.hypot(view[0], view[1]);
     count = Math.min(MAX_CASCADES, Math.max(2, Math.ceil(Math.log(diag * 3 + 1) / Math.log(4))));
@@ -394,12 +452,13 @@ export function createRenderer(canvas) {
     Object.values(T).forEach(free);
     const [gw, gh] = grid;
     T = {
-      scene: target(gw, gh, gl.LINEAR),
-      lumaA: target(gw, gh), lumaB: target(gw, gh),
+      mask: target(mask[0], mask[1], gl.LINEAR, FMT.mask),
+      lumaA: target(mask[0], mask[1], gl.NEAREST, FMT.r), lumaB: target(mask[0], mask[1], gl.NEAREST, FMT.r),
+      scene: target(gw, gh),
       jfaA: target(gw, gh), jfaB: target(gw, gh),
-      sdf: target(gw, gh),
-      casA: target(gw * 2, gh * 2), casB: target(gw * 2, gh * 2),
-      irr: target(gw, gh, gl.LINEAR),
+      sdf: target(gw, gh, gl.NEAREST, FMT.r),
+      casA: target(gw * 2, gh * 2, gl.NEAREST, FMT.rgb), casB: target(gw * 2, gh * 2, gl.NEAREST, FMT.rgb),
+      irr: target(gw, gh, gl.LINEAR, FMT.rgb),
     };
   }
 
@@ -413,7 +472,8 @@ export function createRenderer(canvas) {
 
   function draw(f) {
     const segs = f.segs.slice(0, MAX_SEGS);
-    segs.forEach((s, i) => segData.set([toGridX(s.ax), toGridY(s.ay), toGridX(s.bx), toGridY(s.by)], i * 4));
+    const u = (x) => x / aspect + 0.5, v = (y) => y + 0.5;
+    segs.forEach((s, i) => segData.set([u(s.ax), v(s.ay), u(s.bx), v(s.by)], i * 4));
     const lights = f.lights.slice(0, MAX_LIGHTS);
     lights.forEach((l, i) => {
       lightData.set([toGridX(l.x), toGridY(l.y), Math.max(1.5, l.r * view[1]), l.I], i * 4);
@@ -427,14 +487,15 @@ export function createRenderer(canvas) {
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, v);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-      const va = v.videoWidth / v.videoHeight, a = view[0] / view[1];
+      const va = v.videoWidth / v.videoHeight, a = mask[0] / mask[1];
       const cover = a > va ? [1, va / a] : [a / va, 1];
-      run(P.luma, T.lumaB, { uVideo: videoTex, uPrev: T.lumaA, uView: view, uCover: cover, uBlend: 0.5 });
+      run(P.luma, T.lumaB, { uVideo: videoTex, uPrev: T.lumaA, uMaskSize: mask, uCover: cover, uBlend: 0.5 });
       [T.lumaA, T.lumaB] = [T.lumaB, T.lumaA];
-      run(P.sceneEdges, T.scene, { ...lightU, uLuma: T.lumaA, uView: view, uThresh: f.edgeThresh });
+      run(P.maskEdges, T.mask, { uLuma: T.lumaA, uThresh: f.edgeThresh });
     } else {
-      run(P.sceneSegs, T.scene, { ...lightU, uSegs: segData, uNumSegs: segs.length, uLineWidth: 0.9 });
+      run(P.maskSegs, T.mask, { uSegs: segData, uNumSegs: segs.length, uMaskSize: mask, uLineWidth: 0.6 });
     }
+    run(P.scene, T.scene, { ...lightU, uMask: T.mask, uView: view });
 
     run(P.jfaSeed, T.jfaA, { uScene: T.scene });
     for (let step = 1 << Math.floor(Math.log2(Math.max(...grid))); step >= 1; step >>= 1) {
@@ -454,7 +515,7 @@ export function createRenderer(canvas) {
     run(P.irradiance, T.irr, { uC0: T.casA, uScene: T.scene });
 
     run(P.display, null, {
-      ...lightU, uIrr: T.irr, uScene: T.scene,
+      ...lightU, uIrr: T.irr, uScene: T.scene, uMask: T.mask,
       uRes: [canvas.width, canvas.height], uView: view, uGrid: grid,
       uExposure: 0.7, uLineAlpha: 0.25, uFrame: f.frame,
     });
