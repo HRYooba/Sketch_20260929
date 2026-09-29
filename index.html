@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2D GI Sketch</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+  #hint {
+    position: fixed; left: 12px; bottom: 10px;
+    font: 11px/1.4 ui-monospace, Menlo, Consolas, monospace;
+    color: rgba(255,255,255,.45); pointer-events: none; user-select: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">click: new scene / space: pause / s: save</div>
+<script src="main.js"></script>
+</body>
+</html>
