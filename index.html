@@ -20,11 +20,17 @@
     padding: 6px 10px; cursor: pointer;
   }
   #cam.on { color: #fff; border-color: rgba(255,255,255,.7); }
+  #preview {
+    position: fixed; right: 12px; bottom: 44px; width: 160px;
+    transform: scaleX(-1); border-radius: 4px; opacity: .85; pointer-events: none;
+  }
+  #preview[hidden] { display: none; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="hint">click: new scene / c: camera / space: pause / s: save</div>
+<div id="hint">click: new scene / c: camera / [ ]: edge / space: pause / s: save</div>
+<video id="preview" playsinline muted hidden></video>
 <button id="cam" type="button">camera</button>
 <script type="module" src="main.js"></script>
 </body>
