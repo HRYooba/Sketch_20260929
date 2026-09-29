@@ -1,18 +1,22 @@
 'use strict';
 
-const MAX_BOXES = 16;
+// 遮蔽物は太さゼロの線分。各画素から見て線分が塞ぐ角度区間を解析的に求め、
+// 色つきの環境光（角度のフーリエ級数）と円盤光源を、塞がれていない角度だけ積分する。
+// サンプリングを使わないのでノイズも時間方向の蓄積も無い。
+
+const MAX_SEGS = 24;
 const MAX_LIGHTS = 8;
-// GI はコストが高いので表示解像度より低く回し、表示パスで拡大する
-const GI_SCALE = 0.5;
-const DIRECT_STEPS = 64;
-const INDIRECT_RAYS = 6;
+const ENV_ORDER = 4;
 
 const canvas = document.getElementById('c');
 const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true });
-if (!gl || !gl.getExtension('EXT_color_buffer_float')) {
-  document.body.innerHTML = '<p style="color:#aaa;font:14px sans-serif;padding:2em">WebGL2 + float render target が必要です</p>';
+if (!gl) {
+  document.body.innerHTML = '<p style="color:#aaa;font:14px sans-serif;padding:2em">WebGL2 が必要です</p>';
   throw new Error('WebGL2 unsupported');
 }
+
+const params = new URLSearchParams(location.search);
+const RES_SCALE = Number(params.get('res')) || 1;
 
 const VERT = `#version 300 es
 void main(){
@@ -20,140 +24,168 @@ void main(){
   gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }`;
 
-const COMMON = `#version 300 es
+const FRAG = `#version 300 es
 precision highp float;
-#define MAX_BOXES ${MAX_BOXES}
+#define MAX_SEGS ${MAX_SEGS}
 #define MAX_LIGHTS ${MAX_LIGHTS}
+#define ENV_ORDER ${ENV_ORDER}
+#define MAXI ${MAX_SEGS * 2}
 #define PI 3.14159265
 #define TAU 6.2831853
-uniform vec4 uBoxes[MAX_BOXES];   // cx, cy, hx, hy
-uniform float uAngles[MAX_BOXES];
-uniform int uNumBoxes;
-uniform vec4 uLights[MAX_LIGHTS]; // x, y, radius, intensity
+
+uniform vec4 uSegs[MAX_SEGS];        // ax, ay, bx, by
+uniform int uNumSegs;
+uniform vec4 uLights[MAX_LIGHTS];    // x, y, radius, intensity
 uniform vec3 uLightCols[MAX_LIGHTS];
 uniform int uNumLights;
-uniform float uAspect;
+uniform vec3 uEnvA[ENV_ORDER + 1];   // L(θ) = A0 + Σ An cos nθ' + Bn sin nθ'
+uniform vec3 uEnvB[ENV_ORDER + 1];
+uniform float uEnvRot;
+uniform float uBlocked;              // 塞がれた方向から返ってくる光の割合（簡易バウンス）
+uniform float uExposure;
+uniform float uLineAlpha;
+uniform float uFalloff;
 uniform vec2 uRes;
+uniform float uAspect;
+uniform uint uFrame;
 out vec4 fragColor;
 
-float sdBox(vec2 p, vec2 b){ vec2 d = abs(p) - b; return length(max(d, 0.)) + min(max(d.x, d.y), 0.); }
-float sdOcc(vec2 p){
-  float d = 1e5;
-  for (int i = 0; i < MAX_BOXES; i++) {
-    if (i >= uNumBoxes) break;
-    vec4 b = uBoxes[i];
-    float c = cos(uAngles[i]), s = sin(uAngles[i]);
-    vec2 q = p - b.xy;
-    q = vec2(c * q.x + s * q.y, -s * q.x + c * q.y);
-    d = min(d, sdBox(q, b.zw));
-  }
-  return d;
-}
-vec2 toWorld(vec2 uv){ return (uv - .5) * vec2(uAspect, 1.); }
-vec2 toUV(vec2 p){ return p / vec2(uAspect, 1.) + .5; }
-uint pcg(uint v){ uint s = v * 747796405u + 2891336453u; uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u; return (w >> 22u) ^ w; }
-float rnd(inout uint s){ s = pcg(s); return float(s) / 4294967295.; }
-`;
+float gS[MAXI];
+float gE[MAXI];
+int gN;
 
-const SDF_FRAG = COMMON + `
-void main(){
-  vec2 p = toWorld(gl_FragCoord.xy / uRes);
-  fragColor = vec4(sdOcc(p), 0., 0., 1.);
-}`;
-
-const GI_FRAG = COMMON + `
-uniform sampler2D uSdf;
-uniform sampler2D uPrev;
-uniform uint uFrame;
-uniform float uBlend;
-uniform float uBounce;
-uniform vec3 uAmbient;
-
-float occAt(vec2 p){ return texture(uSdf, toUV(p)).x; }
-
-// 遮蔽物に当たった距離を返す。maxT まで何も無ければ -1
-float march(vec2 o, vec2 dir, float maxT, float px){
-  float t = 0.;
-  // 遮蔽物の内側（と境界から 1px 以内）から出るレイは、その箱を抜けるまで遮蔽とみなさない
-  bool inside = occAt(o) < px;
-  for (int i = 0; i < ${DIRECT_STEPS}; i++) {
-    if (t >= maxT) return -1.;
-    vec2 q = o + dir * t;
-    vec2 uv = toUV(q);
-    if (uv.x < 0. || uv.y < 0. || uv.x > 1. || uv.y > 1.) return -1.;
-    float d = occAt(q);
-    if (inside) { if (d > px) inside = false; t += max(abs(d), px); continue; }
-    if (d < px * .5) return t;
-    t += max(d, px * .5);
-  }
-  return -1.;
+void push(float s, float e){
+  if (e > s && gN < MAXI) { gS[gN] = s; gE[gN] = e; gN++; }
 }
 
-void main(){
-  vec2 uv = gl_FragCoord.xy / uRes;
-  vec2 p = toWorld(uv);
-  float px = 1. / uRes.y;
-  uint seed = pcg(uint(gl_FragCoord.x) * 1973u + uint(gl_FragCoord.y) * 9277u + uFrame * 26699u);
-
-  vec3 E = vec3(0.);
-  // 直接光: 光源円盤上の点へシャドウレイを飛ばし、見込み角で重み付けする
-  for (int i = 0; i < MAX_LIGHTS; i++) {
-    if (i >= uNumLights) break;
-    vec4 L = uLights[i];
-    vec2 toL = L.xy - p;
-    float d = length(toL);
-    vec2 dir = toL / max(d, 1e-5);
-    vec2 n = vec2(-dir.y, dir.x);
-    vec2 tgt = L.xy + n * (rnd(seed) * 2. - 1.) * L.z;
-    vec2 td = tgt - p;
-    float dd = length(td);
-    if (march(p, td / max(dd, 1e-5), dd, px) < 0.) {
-      float ang = d > L.z ? 2. * asin(L.z / d) : PI;
-      E += uLightCols[i] * L.w * ang / TAU;
-    }
+void sortMerge(){
+  for (int i = 1; i < MAXI; i++) {
+    if (i >= gN) break;
+    float s = gS[i], e = gE[i];
+    int j = i - 1;
+    while (j >= 0 && gS[j] > s) { gS[j + 1] = gS[j]; gE[j + 1] = gE[j]; j--; }
+    gS[j + 1] = s; gE[j + 1] = e;
   }
-  // 間接光: 当たった面の手前の前フレーム照度を拾う（多重バウンスがフレームをまたいで積もる）
-  float jitter = rnd(seed);
-  for (int k = 0; k < ${INDIRECT_RAYS}; k++) {
-    float a = (float(k) + jitter) / float(${INDIRECT_RAYS}) * TAU;
-    vec2 dir = vec2(cos(a), sin(a));
-    float h = march(p, dir, 3., px);
-    vec3 r = h < 0. ? uAmbient : texture(uPrev, toUV(p + dir * max(h - 2. * px, 0.))).rgb * uBounce;
-    E += r / float(${INDIRECT_RAYS});
+  int m = 0;
+  for (int i = 0; i < MAXI; i++) {
+    if (i >= gN) break;
+    if (m > 0 && gS[i] <= gE[m - 1]) gE[m - 1] = max(gE[m - 1], gE[i]);
+    else { gS[m] = gS[i]; gE[m] = gE[i]; m++; }
   }
+  gN = m;
+}
 
-  vec3 prev = texture(uPrev, uv).rgb;
-  fragColor = vec4(mix(prev, E, uBlend), 1.);
-}`;
+float wrapPi(float a){ return a - TAU * floor((a + PI) / TAU); }
+float ang(vec2 v){ float a = atan(v.y, v.x); return a < 0. ? a + TAU : a; }
 
-const DISPLAY_FRAG = COMMON + `
-uniform sampler2D uGI;
-uniform float uExposure;
-uniform uint uFrame;
+vec3 envInt(float s, float e){
+  vec3 r = uEnvA[0] * (e - s);
+  for (int n = 1; n <= ENV_ORDER; n++) {
+    float fn = float(n);
+    float ce = fn * (e - uEnvRot), cs = fn * (s - uEnvRot);
+    r += (uEnvA[n] * (sin(ce) - sin(cs)) - uEnvB[n] * (cos(ce) - cos(cs))) / fn;
+  }
+  return r;
+}
+
+// 区間 [s, s+len] のうち [lo, hi] に入る長さ（±TAU 巻き戻した分も数える）
+float overlap(float s, float len, float lo, float hi){
+  float o = 0.;
+  for (int k = -1; k <= 1; k++) {
+    float a = s + float(k) * TAU;
+    o += max(0., min(a + len, hi) - max(a, lo));
+  }
+  return o;
+}
+
+float sdSeg(vec2 p, vec2 a, vec2 b){
+  vec2 pa = p - a, ba = b - a;
+  float h = clamp(dot(pa, ba) / dot(ba, ba), 0., 1.);
+  return length(pa - ba * h);
+}
 
 vec3 aces(vec3 x){ return clamp((x * (2.51 * x + .03)) / (x * (2.43 * x + .59) + .14), 0., 1.); }
+uint pcg(uint v){ uint s = v * 747796405u + 2891336453u; uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u; return (w >> 22u) ^ w; }
+
+vec3 shade(vec2 p){
+  // 環境光: 線分が塞ぐ角度区間の和集合を除いて積分する
+  gN = 0;
+  for (int i = 0; i < MAX_SEGS; i++) {
+    if (i >= uNumSegs) break;
+    vec4 sg = uSegs[i];
+    float a = ang(sg.xy - p);
+    float d = wrapPi(ang(sg.zw - p) - a);
+    float s = d > 0. ? a : a + d;
+    if (s < 0.) s += TAU;
+    float e = s + abs(d);
+    if (e > TAU) { push(s, TAU); push(0., e - TAU); }
+    else push(s, e);
+  }
+  sortMerge();
+  vec3 total = uEnvA[0] * TAU;
+  vec3 blocked = vec3(0.);
+  for (int i = 0; i < MAXI; i++) {
+    if (i >= gN) break;
+    blocked += envInt(gS[i], gE[i]);
+  }
+  vec3 E = (total - (1. - uBlocked) * blocked) / TAU;
+
+  // 円盤光源: 光源より手前にある線分の部分だけが遮る。
+  // 見込み角が小さいので遮蔽の重なりは和で近似し、見込み角で頭打ちにする
+  for (int l = 0; l < MAX_LIGHTS; l++) {
+    if (l >= uNumLights) break;
+    vec4 L = uLights[l];
+    vec2 toL = L.xy - p;
+    float dist = length(toL);
+    float half_ = asin(min(L.z / max(dist, 1e-5), 1.));
+    float phi = atan(toL.y, toL.x);
+    float cov = 0.;
+    for (int i = 0; i < MAX_SEGS; i++) {
+      if (i >= uNumSegs) break;
+      vec4 sg = uSegs[i];
+      vec2 a = sg.xy - p, dv = sg.zw - sg.xy;
+      float A = dot(dv, dv), B = dot(a, dv), C = dot(a, a) - dist * dist;
+      float disc = B * B - A * C;
+      if (disc <= 0.) continue;
+      float sq = sqrt(disc);
+      float t0 = max((-B - sq) / A, 0.), t1 = min((-B + sq) / A, 1.);
+      if (t0 >= t1) continue;
+      float ra = wrapPi(atan(a.y + t0 * dv.y, a.x + t0 * dv.x) - phi);
+      float rb = wrapPi(atan(a.y + t1 * dv.y, a.x + t1 * dv.x) - phi);
+      float d = wrapPi(rb - ra);
+      cov += overlap(d > 0. ? ra : ra + d, abs(d), -half_, half_);
+    }
+    float vis = max(2. * half_ - cov, 0.);
+    // 見込み角による 1/d に加え、光源が画面全体を照らしすぎないよう減衰をかける
+    E += uLightCols[l] * L.w * vis / TAU / (1. + uFalloff * dist);
+  }
+  return E;
+}
 
 void main(){
   vec2 uv = gl_FragCoord.xy / uRes;
-  vec2 p = toWorld(uv);
+  vec2 p = (uv - .5) * vec2(uAspect, 1.);
   float px = 1. / uRes.y;
-  vec3 E = texture(uGI, uv).rgb;
 
-  float sd = sdOcc(p);
-  float inside = smoothstep(px, -px, sd);
-  vec3 alb = mix(vec3(.92, .9, .88), vec3(.78, .77, .8), inside);
-  vec3 col = alb * E * uExposure;
+  vec3 col = shade(p) * uExposure;
 
-  for (int i = 0; i < MAX_LIGHTS; i++) {
-    if (i >= uNumLights) break;
-    vec4 L = uLights[i];
+  float dl = 1e5;
+  for (int i = 0; i < MAX_SEGS; i++) {
+    if (i >= uNumSegs) break;
+    dl = min(dl, sdSeg(p, uSegs[i].xy, uSegs[i].zw));
+  }
+  col *= 1. - uLineAlpha * smoothstep(1.5 * px, 0., dl);
+
+  for (int l = 0; l < MAX_LIGHTS; l++) {
+    if (l >= uNumLights) break;
+    vec4 L = uLights[l];
     float d = length(p - L.xy);
-    col += uLightCols[i] * L.w * 6e-6 / (d * d + 1e-4);
+    col += uLightCols[l] * L.w * 2.5e-6 / (d * d + 5e-5);
   }
 
   col = pow(aces(col), vec3(1. / 2.2));
-  uint seed = pcg(uint(gl_FragCoord.x) * 7919u + uint(gl_FragCoord.y) * 104729u + uFrame * 31u);
-  col += (rnd(seed) - .5) * (3. / 255.);
+  uint s = pcg(uint(gl_FragCoord.x) * 7919u + uint(gl_FragCoord.y) * 104729u + uFrame * 31u);
+  col += (float(s) / 4294967295. - .5) * (2. / 255.);
   fragColor = vec4(col, 1.);
 }`;
 
@@ -164,56 +196,27 @@ function compile(type, src) {
   if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
   return s;
 }
-function program(frag) {
-  const p = gl.createProgram();
-  gl.attachShader(p, compile(gl.VERTEX_SHADER, VERT));
-  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, frag));
-  gl.linkProgram(p);
-  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
-  const loc = {};
-  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
-  for (let i = 0; i < n; i++) {
-    const name = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, '');
-    loc[name] = gl.getUniformLocation(p, name);
-  }
-  return { p, loc };
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+const loc = {};
+for (let i = 0, n = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS); i < n; i++) {
+  const name = gl.getActiveUniform(prog, i).name.replace(/\[0\]$/, '');
+  loc[name] = gl.getUniformLocation(prog, name);
 }
-
-const progSdf = program(SDF_FRAG);
-const progGi = program(GI_FRAG);
-const progDisplay = program(DISPLAY_FRAG);
+gl.useProgram(prog);
 gl.bindVertexArray(gl.createVertexArray());
 
-function target(w, h) {
-  const tex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  const fb = gl.createFramebuffer();
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-  gl.clearColor(0, 0, 0, 1);
-  gl.clear(gl.COLOR_BUFFER_BIT);
-  return { tex, fb, w, h };
-}
-function freeTarget(t) { if (t) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); } }
-
-let W = 0, H = 0, sdfT, giA, giB;
+let W = 0, H = 0;
 function resize() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  // 画素あたりの計算が重いので DPR は 1.5 で頭打ちにする
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.5) * RES_SCALE;
   W = Math.floor(innerWidth * dpr);
   H = Math.floor(innerHeight * dpr);
   canvas.width = W;
   canvas.height = H;
-  const gw = Math.max(1, Math.floor(W * GI_SCALE)), gh = Math.max(1, Math.floor(H * GI_SCALE));
-  [sdfT, giA, giB].forEach(freeTarget);
-  sdfT = target(gw, gh);
-  giA = target(gw, gh);
-  giB = target(gw, gh);
-  accum = 0;
 }
 
 // --- scene -------------------------------------------------------------
@@ -227,168 +230,179 @@ function mulberry32(a) {
   };
 }
 
-const PALETTE = [
-  [1.0, 0.42, 0.1],
-  [0.55, 0.62, 1.0],
-  [1.0, 0.7, 0.78],
-  [1.0, 0.9, 0.78],
-  [0.7, 0.88, 1.0],
-  [0.6, 1.0, 0.75],
-];
+const COLORS = {
+  orange: [1.0, 0.45, 0.12],
+  blue: [0.5, 0.6, 1.0],
+  pink: [1.0, 0.68, 0.76],
+  cream: [1.0, 0.9, 0.78],
+  ice: [0.75, 0.88, 1.0],
+  mint: [0.6, 1.0, 0.78],
+};
+const pick = (R, arr) => arr[Math.floor(R() * arr.length)];
+
+// 環境光は「基底 + 方向つきの色ローブ」で定義し、フーリエ係数へ射影して GPU に渡す
+function envCoeffs(base, lobes) {
+  const N = 256;
+  const A = Array.from({ length: ENV_ORDER + 1 }, () => [0, 0, 0]);
+  const B = Array.from({ length: ENV_ORDER + 1 }, () => [0, 0, 0]);
+  for (let k = 0; k < N; k++) {
+    const t = (k / N) * Math.PI * 2;
+    const L = base.slice();
+    for (const lb of lobes) {
+      const w = lb.I * Math.pow(Math.max(0, Math.cos(t - lb.dir)), lb.k);
+      for (let c = 0; c < 3; c++) L[c] += lb.col[c] * w;
+    }
+    for (let n = 0; n <= ENV_ORDER; n++) {
+      const cn = Math.cos(n * t), sn = Math.sin(n * t);
+      const f = n === 0 ? 1 / N : 2 / N;
+      for (let c = 0; c < 3; c++) { A[n][c] += L[c] * cn * f; B[n][c] += L[c] * sn * f; }
+    }
+  }
+  return { A: new Float32Array(A.flat()), B: new Float32Array(B.flat()) };
+}
 
 let scene;
+
 function makeScene(seed) {
   const R = mulberry32(seed);
   const aspect = innerWidth / innerHeight;
-  const boxes = [];
-  const mode = Math.floor(R() * 3);
+  const segs = [];
+  const lights = [];
+  let env;
+  const mode = params.get('mode') !== null ? Number(params.get('mode')) : Math.floor(R() * 3);
+
+  // 光源は線分端のすぐ先に置く（端から扇状に光が回り込む）
+  const tipLight = (s, end, col, I) => {
+    const r = 0.004 + R() * 0.006;
+    lights.push({ seg: s, end, off: (end ? 1 : -1) * (r + 0.004), side: (R() - 0.5) * 0.01, r, I, col, ph: R() * 10 });
+  };
+
   if (mode === 0) {
-    // 45° に傾いた大きな板
-    const n = 4 + Math.floor(R() * 5);
+    // 45° の折れ線（V 字・菱形の一部）
+    const n = 4 + Math.floor(R() * 4);
     for (let i = 0; i < n; i++) {
-      const h = 0.07 + R() * 0.16;
-      boxes.push({
-        x: (R() - 0.5) * aspect * 1.1, y: (R() - 0.5) * 1.1,
-        hx: h, hy: h * (0.5 + R() * 1.0),
-        a: Math.PI / 4 + (R() < 0.3 ? Math.PI / 2 : 0),
-      });
-    }
-  } else if (mode === 1) {
-    // 上下の列に並ぶ壁
-    const cols = 3 + Math.floor(R() * 3);
-    const hx = 0.02 + R() * 0.05;
-    const hy = 0.1 + R() * 0.12;
-    for (const row of [-1, 1]) {
-      for (let c = 0; c < cols; c++) {
-        boxes.push({
-          x: ((c + 0.5) / cols - 0.5) * aspect,
-          y: row * (0.5 - hy * 0.6),
-          hx, hy, a: 0,
-        });
+      let x = (R() - 0.5) * aspect * 1.1, y = (R() - 0.5) * 1.1;
+      let dir = Math.floor(R() * 4) * 2 + 1;
+      const k = 1 + Math.floor(R() * 3);
+      for (let j = 0; j < k; j++) {
+        const len = 0.12 + R() * 0.3;
+        const a = (dir * Math.PI) / 4;
+        const nx = x + Math.cos(a) * len, ny = y + Math.sin(a) * len;
+        segs.push({ ax: x, ay: y, bx: nx, by: ny });
+        x = nx; y = ny;
+        dir = (dir + (R() < 0.5 ? 2 : 6)) % 8;
       }
     }
-  } else {
-    // 任意角の細長い破片
-    const n = 5 + Math.floor(R() * 6);
+    env = envCoeffs([0.06, 0.06, 0.07], [
+      { dir: Math.PI * 0.3, k: 4, I: 2.2, col: COLORS.orange },
+      { dir: Math.PI * 1.1, k: 3, I: 1.4, col: COLORS.blue },
+      { dir: Math.PI * 1.6, k: 2, I: 0.8, col: COLORS.cream },
+    ]);
+    for (let i = 0; i < 4; i++) tipLight(pick(R, segs), R() < 0.5, pick(R, [COLORS.ice, COLORS.cream, COLORS.blue]), 14 + R() * 12);
+  } else if (mode === 1) {
+    // 暗い空間に水平の棚が浮く
+    const n = 2 + Math.floor(R() * 3);
     for (let i = 0; i < n; i++) {
-      boxes.push({
-        x: (R() - 0.5) * aspect * 1.1, y: (R() - 0.5) * 1.1,
-        hx: 0.03 + R() * 0.2, hy: 0.01 + R() * 0.05,
-        a: R() * Math.PI,
-      });
+      const y = ((i + 0.5) / n - 0.5) * 0.8 + (R() - 0.5) * 0.05;
+      const x = (R() - 0.5) * 0.3;
+      const w = 0.08 + R() * 0.12;
+      segs.push({ ax: x - w, ay: y, bx: x + w, by: y });
     }
-  }
-  boxes.forEach((b) => { b.a0 = b.a; b.ph = R() * 10; });
-
-  // 光源は箱の角のすぐ外側に置き、箱と一緒に動かす
-  const lights = [];
-  const nL = Math.min(MAX_LIGHTS - 1, 3 + Math.floor(R() * 3));
-  for (let i = 0; i < nL; i++) {
-    lights.push({
-      box: Math.floor(R() * boxes.length),
-      sx: R() < 0.5 ? -1 : 1, sy: R() < 0.5 ? -1 : 1,
-      r: 0.006 + R() * 0.01,
-      I: 10 + R() * 25,
-      col: PALETTE[Math.floor(R() * PALETTE.length)],
-      ph: R() * 10,
+    env = envCoeffs([0.01, 0.01, 0.012], [
+      { dir: Math.PI * 0.5, k: 8, I: 0.25, col: COLORS.cream },
+      { dir: Math.PI * 1.5, k: 8, I: 0.2, col: COLORS.pink },
+      { dir: 0, k: 2, I: 0.08, col: COLORS.mint },
+    ]);
+    segs.forEach((s) => {
+      tipLight(s, false, pick(R, [COLORS.pink, COLORS.cream]), 18 + R() * 14);
+      if (R() < 0.5) tipLight(s, true, pick(R, [COLORS.mint, COLORS.ice]), 8 + R() * 8);
+    });
+  } else {
+    // 上下に並ぶ短い縦の壁
+    const cols = 3 + Math.floor(R() * 3);
+    const h = 0.1 + R() * 0.1;
+    for (const row of [-1, 1]) {
+      for (let c = 0; c < cols; c++) {
+        const x = ((c + 0.5) / cols - 0.5) * aspect * 0.95;
+        segs.push({ ax: x, ay: row * 0.5, bx: x, by: row * (0.5 - h) });
+      }
+    }
+    env = envCoeffs([0.04, 0.03, 0.03], [
+      { dir: 0, k: 2, I: 0.3, col: COLORS.pink },
+      { dir: Math.PI, k: 2, I: 0.3, col: COLORS.pink },
+    ]);
+    segs.forEach((s) => {
+      if (R() < 0.6) tipLight(s, true, s.ay < 0 ? COLORS.orange : pick(R, [COLORS.cream, COLORS.pink]), 12 + R() * 14);
     });
   }
-  scene = { boxes: boxes.slice(0, MAX_BOXES), lights };
-  accum = 0;
+
+  segs.forEach((s) => { s.ph = R() * 10; s.ax0 = s.ax; s.ay0 = s.ay; s.bx0 = s.bx; s.by0 = s.by; });
+  scene = { segs: segs.slice(0, MAX_SEGS), lights: lights.slice(0, MAX_LIGHTS - 1), env, rot0: R() * Math.PI * 2 };
 }
 
 const mouse = { x: 0, y: 0, on: false };
 let paused = false;
-let accum = 0;
 let frame = 0;
 let time = 0;
 let last = performance.now();
 
-const boxData = new Float32Array(MAX_BOXES * 4);
-const angData = new Float32Array(MAX_BOXES);
+const segData = new Float32Array(MAX_SEGS * 4);
 const lightData = new Float32Array(MAX_LIGHTS * 4);
 const lightColData = new Float32Array(MAX_LIGHTS * 3);
-let numLights = 0;
 
-function updateScene(t) {
-  const { boxes, lights } = scene;
-  boxes.forEach((b, i) => {
-    b.a = b.a0 + 0.06 * Math.sin(t * 0.17 + b.ph);
-    boxData.set([b.x, b.y, b.hx, b.hy], i * 4);
-    angData[i] = b.a;
+function update(t) {
+  const { segs, lights } = scene;
+  segs.forEach((s, i) => {
+    // 各線分を中点まわりにわずかに揺らす
+    const cx = (s.ax0 + s.bx0) / 2, cy = (s.ay0 + s.by0) / 2;
+    const a = 0.03 * Math.sin(t * 0.21 + s.ph);
+    const c = Math.cos(a), sn = Math.sin(a);
+    const rot = (x, y) => [cx + c * (x - cx) - sn * (y - cy), cy + sn * (x - cx) + c * (y - cy)];
+    [s.ax, s.ay] = rot(s.ax0, s.ay0);
+    [s.bx, s.by] = rot(s.bx0, s.by0);
+    segData.set([s.ax, s.ay, s.bx, s.by], i * 4);
   });
-  numLights = 0;
+  let n = 0;
   for (const l of lights) {
-    const b = boxes[l.box];
-    const c = Math.cos(b.a), s = Math.sin(b.a);
-    const off = l.r + 0.006;
-    const lx = l.sx * (b.hx + off), ly = l.sy * (b.hy + off);
-    const flicker = 1 + 0.15 * Math.sin(t * 0.7 + l.ph);
-    lightData.set([b.x + c * lx - s * ly, b.y + s * lx + c * ly, l.r, l.I * flicker], numLights * 4);
-    lightColData.set(l.col, numLights * 3);
-    numLights++;
+    const s = l.seg;
+    const dx = s.bx - s.ax, dy = s.by - s.ay, len = Math.hypot(dx, dy);
+    const ux = dx / len, uy = dy / len;
+    const tx = l.end ? s.bx : s.ax, ty = l.end ? s.by : s.ay;
+    const side = l.side + 0.004 * Math.sin(t * 0.5 + l.ph);
+    lightData.set([tx + ux * l.off - uy * side, ty + uy * l.off + ux * side, l.r, l.I * (1 + 0.12 * Math.sin(t * 0.6 + l.ph))], n * 4);
+    lightColData.set(l.col, n * 3);
+    n++;
   }
   if (mouse.on) {
-    lightData.set([mouse.x, mouse.y, 0.012, 20], numLights * 4);
-    lightColData.set([1, 0.95, 0.9], numLights * 3);
-    numLights++;
+    lightData.set([mouse.x, mouse.y, 0.008, 22], n * 4);
+    lightColData.set([1, 0.95, 0.9], n * 3);
+    n++;
   }
-}
-
-function setCommon(prog, w, h) {
-  const L = prog.loc;
-  gl.uniform4fv(L.uBoxes, boxData);
-  gl.uniform1fv(L.uAngles, angData);
-  gl.uniform1i(L.uNumBoxes, scene.boxes.length);
-  gl.uniform4fv(L.uLights, lightData);
-  gl.uniform3fv(L.uLightCols, lightColData);
-  gl.uniform1i(L.uNumLights, numLights);
-  gl.uniform1f(L.uAspect, W / H);
-  gl.uniform2f(L.uRes, w, h);
+  return n;
 }
 
 function render(now) {
   const dt = Math.min((now - last) / 1000, 0.1);
   last = now;
   if (!paused) time += dt;
-  updateScene(time);
+  const numLights = update(time);
 
-  gl.bindFramebuffer(gl.FRAMEBUFFER, sdfT.fb);
-  gl.viewport(0, 0, sdfT.w, sdfT.h);
-  gl.useProgram(progSdf.p);
-  setCommon(progSdf, sdfT.w, sdfT.h);
-  gl.drawArrays(gl.TRIANGLES, 0, 3);
-
-  // 停止中は累積平均で収束させ、動いている間は指数移動平均で追従させる
-  accum++;
-  const blend = paused && !mouse.on ? Math.max(1 / accum, 0.002) : Math.max(1 / accum, 0.06);
-
-  gl.bindFramebuffer(gl.FRAMEBUFFER, giB.fb);
-  gl.viewport(0, 0, giB.w, giB.h);
-  gl.useProgram(progGi.p);
-  setCommon(progGi, giB.w, giB.h);
-  gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, sdfT.tex);
-  gl.uniform1i(progGi.loc.uSdf, 0);
-  gl.activeTexture(gl.TEXTURE1);
-  gl.bindTexture(gl.TEXTURE_2D, giA.tex);
-  gl.uniform1i(progGi.loc.uPrev, 1);
-  gl.uniform1ui(progGi.loc.uFrame, frame);
-  gl.uniform1f(progGi.loc.uBlend, blend);
-  gl.uniform1f(progGi.loc.uBounce, 0.72);
-  gl.uniform3f(progGi.loc.uAmbient, 0.04, 0.042, 0.055);
-  gl.drawArrays(gl.TRIANGLES, 0, 3);
-  [giA, giB] = [giB, giA];
-
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, W, H);
-  gl.useProgram(progDisplay.p);
-  setCommon(progDisplay, W, H);
-  gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, giA.tex);
-  gl.uniform1i(progDisplay.loc.uGI, 0);
-  gl.uniform1f(progDisplay.loc.uExposure, 0.75);
-  gl.uniform1ui(progDisplay.loc.uFrame, frame);
+  gl.uniform4fv(loc.uSegs, segData);
+  gl.uniform1i(loc.uNumSegs, scene.segs.length);
+  gl.uniform4fv(loc.uLights, lightData);
+  gl.uniform3fv(loc.uLightCols, lightColData);
+  gl.uniform1i(loc.uNumLights, numLights);
+  gl.uniform3fv(loc.uEnvA, scene.env.A);
+  gl.uniform3fv(loc.uEnvB, scene.env.B);
+  gl.uniform1f(loc.uEnvRot, scene.rot0 + time * 0.03);
+  gl.uniform1f(loc.uBlocked, 0.04);
+  gl.uniform1f(loc.uFalloff, 8.0);
+  gl.uniform1f(loc.uExposure, 0.7);
+  gl.uniform1f(loc.uLineAlpha, 0.25);
+  gl.uniform2f(loc.uRes, W, H);
+  gl.uniform1f(loc.uAspect, W / H);
+  gl.uniform1ui(loc.uFrame, frame);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   frame++;
@@ -397,18 +411,16 @@ function render(now) {
 
 // --- input -------------------------------------------------------------
 
-function toWorld(e) {
-  const aspect = innerWidth / innerHeight;
-  return { x: (e.clientX / innerWidth - 0.5) * aspect, y: (0.5 - e.clientY / innerHeight) };
-}
 canvas.addEventListener('pointermove', (e) => {
   if (e.pointerType !== 'mouse') return;
-  Object.assign(mouse, toWorld(e), { on: true });
+  mouse.x = (e.clientX / innerWidth - 0.5) * (innerWidth / innerHeight);
+  mouse.y = 0.5 - e.clientY / innerHeight;
+  mouse.on = true;
 });
-canvas.addEventListener('pointerleave', () => { mouse.on = false; accum = 0; });
+canvas.addEventListener('pointerleave', () => { mouse.on = false; });
 canvas.addEventListener('click', () => makeScene((Math.random() * 2 ** 31) | 0));
 addEventListener('keydown', (e) => {
-  if (e.code === 'Space') { paused = !paused; accum = 0; e.preventDefault(); }
+  if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
   if (e.code === 'KeyS') {
     const a = document.createElement('a');
     a.download = `gi-${Date.now()}.png`;
@@ -418,7 +430,6 @@ addEventListener('keydown', (e) => {
 });
 addEventListener('resize', resize);
 
-const seedParam = new URLSearchParams(location.search).get('seed');
 resize();
-makeScene(seedParam ? Number(seedParam) : (Math.random() * 2 ** 31) | 0);
+makeScene(params.get('seed') ? Number(params.get('seed')) : (Math.random() * 2 ** 31) | 0);
 requestAnimationFrame(render);
