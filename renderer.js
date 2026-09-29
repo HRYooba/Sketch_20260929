@@ -1,4 +1,4 @@
-// 2D Radiance Cascades。
+// 2D Radiance Cascades（多数の遮蔽物向け。カメラのエッジに使う）。
 // 遮蔽物と光源を低解像度のグリッドへラスタライズし、JFA で距離場を作り、
 // 角度分解能と区間長を段ごとに 4 倍にしたプローブ群で光を集めて上の段から合成する。
 // コストは遮蔽物の数に依らずグリッド解像度だけで決まる。
@@ -338,7 +338,7 @@ void main(){
   o = vec4(col, 1.);
 }`;
 
-export function createRenderer(canvas) {
+export function createCascadeRenderer(canvas) {
   const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true });
   if (!gl || !gl.getExtension('EXT_color_buffer_float')) throw new Error('WebGL2 + float render target が必要です');
 

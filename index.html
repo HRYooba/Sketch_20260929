@@ -6,7 +6,8 @@
 <title>2D GI Sketch</title>
 <style>
   html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
-  canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+  canvas { position: fixed; inset: 0; display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+  canvas[hidden] { display: none; }
   #hint {
     position: fixed; left: 12px; bottom: 10px;
     font: 11px/1.4 ui-monospace, Menlo, Consolas, monospace;
@@ -29,6 +30,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
+<canvas id="c2" hidden></canvas>
 <div id="hint">click: new scene / c: camera / [ ]: edge / space: pause / s: save</div>
 <video id="preview" playsinline muted hidden></video>
 <button id="cam" type="button">camera</button>
