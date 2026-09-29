@@ -2,6 +2,8 @@ import { createRenderer } from './renderer.js';
 import { randomScene, segsAt, lightsAt } from './scene.js';
 
 const canvas = document.getElementById('c');
+const hint = document.getElementById('hint');
+const hintText = () => `click: new scene / g: GI ${gi ? 'on' : 'off'} / space: pause / s: save`;
 const params = new URLSearchParams(location.search);
 
 let renderer;
@@ -19,6 +21,8 @@ let scale = FIXED_SCALE || 1;
 const aspect = () => innerWidth / innerHeight;
 const resize = () => renderer.resize(innerWidth, innerHeight, scale);
 
+// GI は見た目の差が小さい割に重いので既定で切る（G キーか ?gi=1 で有効）
+let gi = params.get('gi') === '1';
 let scene;
 const newScene = (seed = (Math.random() * 2 ** 31) | 0) => { scene = randomScene(seed, aspect()); };
 
@@ -50,7 +54,7 @@ function render(now) {
   renderer.draw({
     segs, lights,
     env: scene.env, envRot: scene.rot0 + time * 0.03,
-    frame,
+    gi, frame,
   });
 
   frame++;
@@ -67,6 +71,7 @@ canvas.addEventListener('pointerleave', () => { mouse.on = false; });
 canvas.addEventListener('click', () => newScene());
 addEventListener('keydown', (e) => {
   if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
+  if (e.code === 'KeyG') { gi = !gi; hint.textContent = hintText(); }
   if (e.code === 'KeyS') {
     const a = document.createElement('a');
     a.download = `gi-${Date.now()}.png`;
@@ -77,5 +82,6 @@ addEventListener('keydown', (e) => {
 addEventListener('resize', resize);
 
 resize();
+hint.textContent = hintText();
 newScene(params.get('seed') ? Number(params.get('seed')) : undefined);
 requestAnimationFrame(render);
