@@ -1,4 +1,5 @@
-import { ENV_ORDER, MAX_LIGHTS, MAX_SEGS } from './renderer.js';
+import { ENV_ORDER, MAX_LIGHTS } from './renderer.js';
+import { MAX_SEGS } from './analytic.js';
 
 const TAU = Math.PI * 2;
 

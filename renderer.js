@@ -1,9 +1,8 @@
-// 2D Radiance Cascades（多数の遮蔽物向け。カメラのエッジに使う）。
+// 2D Radiance Cascades（多数の遮蔽物向け。カメラ深度の等高線に使う）。
 // 遮蔽物と光源を低解像度のグリッドへラスタライズし、JFA で距離場を作り、
 // 角度分解能と区間長を段ごとに 4 倍にしたプローブ群で光を集めて上の段から合成する。
 // コストは遮蔽物の数に依らずグリッド解像度だけで決まる。
 
-export const MAX_SEGS = 64;
 export const MAX_LIGHTS = 8;
 export const ENV_ORDER = 4;
 
@@ -21,7 +20,6 @@ const HEAD = `#version 300 es
 precision highp float;
 precision highp int;
 #define TAU 6.2831853
-#define MAX_SEGS ${MAX_SEGS}
 #define MAX_LIGHTS ${MAX_LIGHTS}
 #define ENV_ORDER ${ENV_ORDER}
 out vec4 o;
@@ -41,61 +39,55 @@ vec4 lightAt(vec2 p){
 }
 `;
 
-// 線（遮蔽物）は表示解像度のマスクとして持つ。GI グリッドの遮蔽物はこのマスクを縮小して作り、
-// 表示パスではこのマスクで線をまたぐ補間を切る
-const SD_SEG = `
-float sdSeg(vec2 p, vec2 a, vec2 b){
-  vec2 pa = p - a, ba = b - a;
-  float h = clamp(dot(pa, ba) / dot(ba, ba), 0., 1.);
-  return length(pa - ba * h);
-}
-`;
+// 遮蔽物は表示解像度のマスクとして持つ。GI グリッドの遮蔽物はこのマスクを縮小して作り、
+// 表示パスではこのマスクで線をまたぐ補間を切る。
+// マスクはカメラ深度の等高線: 深度を uBands 段に切り、段の境目を線にする。
+// 等高線は閉じた輪になり、そのままだと輪の内側に光が届かないので、
+// 斜面が uDir を向いている側だけを残して開いた弧にする
 
-// uSegs は表示範囲を [0,1] とした座標
-const MASK_SEGS = HEAD + SD_SEG + `
-uniform vec4 uSegs[MAX_SEGS];
-uniform int uNumSegs;
-uniform vec2 uMaskSize;
-uniform float uLineWidth;
-void main(){
-  vec2 p = gl_FragCoord.xy;
-  float d = 1e9;
-  for (int i = 0; i < MAX_SEGS; i++) {
-    if (i >= uNumSegs) break;
-    d = min(d, sdSeg(p, uSegs[i].xy * uMaskSize, uSegs[i].zw * uMaskSize));
-  }
-  o = vec4(clamp(uLineWidth + .5 - d, 0., 1.), 0., 0., 1.);
-}`;
-
-// カメラの輝度を時間方向に平滑化して、エッジのちらつきを抑える
-const LUMA = HEAD + `
-uniform sampler2D uVideo;
+// 深度は推論のたびに飛ぶので、描画フレームごとに少しずつ寄せて平滑化する。
+// 深度テクスチャは推論結果の行順（上が先頭）のまま、x は鏡像にして画面を覆うように切り出す
+const DEPTH_SMOOTH = HEAD + `
+uniform sampler2D uDepth;
 uniform sampler2D uPrev;
 uniform vec2 uMaskSize;
 uniform vec2 uCover;
+uniform float uLo;
+uniform float uHi;
 uniform float uBlend;
 void main(){
   vec2 uv = gl_FragCoord.xy / uMaskSize;
   vec2 v = (uv - .5) * uCover + .5;
-  v.x = 1. - v.x;
-  float l = dot(texture(uVideo, v).rgb, vec3(.299, .587, .114));
+  v = vec2(1. - v.x, 1. - v.y);
+  // 推論解像度のノイズが等高線のギザギザになるので、深度テクセル単位でぼかす
+  vec2 px = 1. / vec2(textureSize(uDepth, 0));
+  float raw = 0.;
+  for (int y = -1; y <= 1; y++) {
+    for (int x = -1; x <= 1; x++) {
+      float w = (x == 0 ? 2. : 1.) * (y == 0 ? 2. : 1.);
+      raw += texture(uDepth, v + vec2(x, y) * px * 1.5).r * w;
+    }
+  }
+  raw /= 16.;
+  float d = clamp((raw - uLo) / max(uHi - uLo, 1e-6), 0., 1.);
   float prev = texelFetch(uPrev, ivec2(gl_FragCoord.xy), 0).r;
-  o = vec4(mix(prev, l, uBlend), 0., 0., 1.);
+  o = vec4(mix(prev, d, uBlend), 0., 0., 1.);
 }`;
 
-const MASK_EDGES = HEAD + `
-uniform sampler2D uLuma;
-uniform float uThresh;
-float lum(ivec2 p){ return texelFetch(uLuma, clamp(p, ivec2(0), textureSize(uLuma, 0) - 1), 0).r; }
+const MASK_CONTOURS = HEAD + `
+uniform sampler2D uDepthS;
+uniform float uBands;
+uniform float uLineWidth;
+uniform vec2 uDir;
 void main(){
-  ivec2 q = ivec2(gl_FragCoord.xy);
-  float a = lum(q + ivec2(-1, 1)), b = lum(q + ivec2(0, 1)), c = lum(q + ivec2(1, 1));
-  float d = lum(q + ivec2(-1, 0)), f = lum(q + ivec2(1, 0));
-  float g = lum(q + ivec2(-1, -1)), h = lum(q + ivec2(0, -1)), k = lum(q + ivec2(1, -1));
-  float gx = c + 2. * f + k - a - 2. * d - g;
-  float gy = a + 2. * b + c - g - 2. * h - k;
-  float m = length(vec2(gx, gy));
-  o = vec4(smoothstep(uThresh * .8, uThresh * 1.25, m), 0., 0., 1.);
+  float f = texelFetch(uDepthS, ivec2(gl_FragCoord.xy), 0).r * uBands;
+  vec2 g = vec2(dFdx(f), dFdy(f));
+  float glen = length(g);
+  // 段の境目までの距離を画素単位にして、傾きに依らず一定の太さの線にする
+  float dist = abs(fract(f + .5) - .5) / max(glen, 1e-4);
+  float line = clamp(uLineWidth + .5 - dist, 0., 1.);
+  float facing = dot(g / max(glen, 1e-6), uDir);
+  o = vec4(line * smoothstep(.05, .35, facing), 0., 0., 1.);
 }`;
 
 // グリッド 1 テクセルが覆うマスクの範囲に線が少しでもあれば遮蔽物にする（光漏れ防止のため保守的に太らせる）
@@ -370,9 +362,8 @@ export function createCascadeRenderer(canvas) {
   }
 
   const P = {
-    maskSegs: program(MASK_SEGS),
-    luma: program(LUMA),
-    maskEdges: program(MASK_EDGES),
+    depthSmooth: program(DEPTH_SMOOTH),
+    contours: program(MASK_CONTOURS),
     scene: program(SCENE),
     jfaSeed: program(JFA_SEED),
     jfaStep: program(JFA_STEP),
@@ -407,8 +398,9 @@ export function createCascadeRenderer(canvas) {
   }
   const free = (t) => { if (t) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); } };
 
-  const videoTex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, videoTex);
+  const depthTex = gl.createTexture();
+  let depthVersion = -1;
+  gl.bindTexture(gl.TEXTURE_2D, depthTex);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -453,7 +445,7 @@ export function createCascadeRenderer(canvas) {
     const [gw, gh] = grid;
     T = {
       mask: target(mask[0], mask[1], gl.LINEAR, FMT.mask),
-      lumaA: target(mask[0], mask[1], gl.NEAREST, FMT.r), lumaB: target(mask[0], mask[1], gl.NEAREST, FMT.r),
+      depthA: target(mask[0], mask[1], gl.NEAREST, FMT.r), depthB: target(mask[0], mask[1], gl.NEAREST, FMT.r),
       scene: target(gw, gh),
       jfaA: target(gw, gh), jfaB: target(gw, gh),
       sdf: target(gw, gh, gl.NEAREST, FMT.r),
@@ -466,14 +458,10 @@ export function createCascadeRenderer(canvas) {
   const toGridX = (x) => (x / aspect + 0.5) * view[0];
   const toGridY = (y) => (y + 0.5) * view[1];
 
-  const segData = new Float32Array(MAX_SEGS * 4);
   const lightData = new Float32Array(MAX_LIGHTS * 4);
   const lightColData = new Float32Array(MAX_LIGHTS * 3);
 
   function draw(f) {
-    const segs = f.segs.slice(0, MAX_SEGS);
-    const u = (x) => x / aspect + 0.5, v = (y) => y + 0.5;
-    segs.forEach((s, i) => segData.set([u(s.ax), v(s.ay), u(s.bx), v(s.by)], i * 4));
     const lights = f.lights.slice(0, MAX_LIGHTS);
     lights.forEach((l, i) => {
       lightData.set([toGridX(l.x), toGridY(l.y), Math.max(1.5, l.r * view[1]), l.I], i * 4);
@@ -481,19 +469,25 @@ export function createCascadeRenderer(canvas) {
     });
     const lightU = { uLights: lightData, uLightCols: lightColData, uNumLights: lights.length };
 
-    if (f.video) {
-      const v = f.video;
-      gl.bindTexture(gl.TEXTURE_2D, videoTex);
-      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, v);
-      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-      const va = v.videoWidth / v.videoHeight, a = mask[0] / mask[1];
-      const cover = a > va ? [1, va / a] : [a / va, 1];
-      run(P.luma, T.lumaB, { uVideo: videoTex, uPrev: T.lumaA, uMaskSize: mask, uCover: cover, uBlend: 0.5 });
-      [T.lumaA, T.lumaB] = [T.lumaB, T.lumaA];
-      run(P.maskEdges, T.mask, { uLuma: T.lumaA, uThresh: f.edgeThresh });
+    const d = f.depth;
+    if (d) {
+      if (d.version !== depthVersion) {
+        gl.bindTexture(gl.TEXTURE_2D, depthTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, d.w, d.h, 0, gl.RED, gl.FLOAT, d.data);
+        depthVersion = d.version;
+      }
+      const da = d.w / d.h, a = mask[0] / mask[1];
+      const cover = a > da ? [1, da / a] : [a / da, 1];
+      run(P.depthSmooth, T.depthB, {
+        uDepth: depthTex, uPrev: T.depthA, uMaskSize: mask, uCover: cover,
+        uLo: f.depthLo, uHi: f.depthHi, uBlend: 0.25,
+      });
+      [T.depthA, T.depthB] = [T.depthB, T.depthA];
+      run(P.contours, T.mask, { uDepthS: T.depthA, uBands: f.bands, uLineWidth: 0.6, uDir: [Math.cos(f.contourDir), Math.sin(f.contourDir)] });
     } else {
-      run(P.maskSegs, T.mask, { uSegs: segData, uNumSegs: segs.length, uMaskSize: mask, uLineWidth: 0.6 });
+      gl.bindFramebuffer(gl.FRAMEBUFFER, T.mask.fb);
+      gl.clearColor(0, 0, 0, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
     }
     run(P.scene, T.scene, { ...lightU, uMask: T.mask, uView: view });
 

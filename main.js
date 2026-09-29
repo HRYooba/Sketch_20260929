@@ -2,12 +2,14 @@ import { createCascadeRenderer } from './renderer.js';
 import { createAnalyticRenderer } from './analytic.js';
 import { randomScene, segsAt, lightsAt } from './scene.js';
 import { Camera } from './camera.js';
+import { DepthEstimator } from './depth.js';
 
 const camButton = document.getElementById('cam');
 const preview = document.getElementById('preview');
+const status = document.getElementById('status');
 const params = new URLSearchParams(location.search);
 
-// 線分シーンは表示解像度で厳密に解く解析版、カメラのエッジは遮蔽物数に依らない Radiance Cascades で描く。
+// 線分シーンは表示解像度で厳密に解く解析版、カメラ深度の等高線は遮蔽物数に依らない Radiance Cascades で描く。
 // 1 つの canvas に 2 つの WebGL コンテキストは持てないので、canvas を分けて表示を切り替える。
 // scale はフレーム時間に合わせて [min, max] で自動調整する（?res= で固定）
 const FIXED_SCALE = Number(params.get('res')) || 0;
@@ -27,9 +29,10 @@ const aspect = () => innerWidth / innerHeight;
 const resize = (m) => m.renderer.resize(innerWidth, innerHeight, m.scale);
 
 const camera = new Camera(preview);
-let edgeThresh = Number(params.get('edge')) || 0.35;
+const depth = new DepthEstimator();
+let bands = Number(params.get('bands')) || 14;
 let scene;
-// カメラモードは線分を持たない専用シーン（光源と環境光だけ）で、遮蔽物はカメラのエッジだけ。
+// カメラモードは線分を持たない専用シーン（光源と環境光だけ）で、遮蔽物はカメラ深度の等高線だけ。
 // カメラの許可待ち・起動中もこのシーンを出すため、モードはカメラの状態と別に持つ
 let cameraMode = false;
 const active = () => (cameraMode ? modes.cascade : modes.analytic);
@@ -64,13 +67,17 @@ function render(now) {
   const lights = lightsAt(scene, segs, time);
   if (mouse.on) lights.push({ x: mouse.x, y: mouse.y, r: 0.008, I: 22, col: [1, 0.95, 0.9] });
 
+  const d = cameraMode ? depth.result : null;
   m.renderer.draw({
     segs, lights,
-    video: cameraMode && camera.ready ? camera.video : null,
-    edgeThresh,
+    depth: d, depthLo: depth.lo, depthHi: depth.hi, bands, contourDir: scene.rot0 + time * 0.1,
     env: scene.env, envRot: scene.rot0 + time * 0.03,
     frame,
   });
+
+  if (cameraMode && frame % 30 === 0) {
+    status.textContent = d ? `depth ${depth.device} ${depth.fps.toFixed(1)}fps / bands ${bands}` : 'depth: loading model…';
+  }
 
   frame++;
   requestAnimationFrame(render);
@@ -82,12 +89,14 @@ function setCameraMode(on) {
   modes.cascade.canvas.hidden = !on;
   camButton.classList.toggle('on', on);
   preview.hidden = !on;
+  status.hidden = !on;
   slowFrames = fastFrames = 0;
   newScene();
 }
 
 async function toggleCamera() {
   if (cameraMode) {
+    depth.stop();
     camera.stop();
     setCameraMode(false);
     return;
@@ -100,7 +109,12 @@ async function toggleCamera() {
     camera.stop();
     setCameraMode(false);
     alert(`カメラを開けませんでした: ${e.message}`);
+    return;
   }
+  depth.run(camera.video).catch((e) => {
+    console.error(e);
+    status.textContent = `depth: ${e.message}`;
+  });
 }
 
 for (const m of Object.values(modes)) {
@@ -117,8 +131,8 @@ camButton.addEventListener('click', toggleCamera);
 addEventListener('keydown', (e) => {
   if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
   if (e.code === 'KeyC') toggleCamera();
-  if (e.code === 'BracketLeft') edgeThresh = Math.max(0.05, edgeThresh * 0.85);
-  if (e.code === 'BracketRight') edgeThresh = Math.min(3, edgeThresh / 0.85);
+  if (e.code === 'BracketLeft') bands = Math.max(2, bands - 2);
+  if (e.code === 'BracketRight') bands = Math.min(60, bands + 2);
   if (e.code === 'KeyS') {
     const a = document.createElement('a');
     a.download = `gi-${Date.now()}.png`;

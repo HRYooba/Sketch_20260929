@@ -25,14 +25,20 @@
     position: fixed; right: 12px; bottom: 44px; width: 160px;
     transform: scaleX(-1); border-radius: 4px; opacity: .85; pointer-events: none;
   }
-  #preview[hidden] { display: none; }
+  #preview[hidden], #status[hidden] { display: none; }
+  #status {
+    position: fixed; right: 12px; bottom: 140px;
+    font: 11px/1.4 ui-monospace, Menlo, Consolas, monospace;
+    color: rgba(255,255,255,.6); pointer-events: none;
+  }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <canvas id="c2" hidden></canvas>
-<div id="hint">click: new scene / c: camera / [ ]: edge / space: pause / s: save</div>
+<div id="hint">click: new scene / c: camera / [ ]: depth bands / space: pause / s: save</div>
 <video id="preview" playsinline muted hidden></video>
+<div id="status" hidden></div>
 <button id="cam" type="button">camera</button>
 <script type="module" src="main.js"></script>
 </body>
