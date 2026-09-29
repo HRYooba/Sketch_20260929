@@ -12,11 +12,20 @@
     font: 11px/1.4 ui-monospace, Menlo, Consolas, monospace;
     color: rgba(255,255,255,.45); pointer-events: none; user-select: none;
   }
+  #cam {
+    position: fixed; right: 12px; bottom: 10px;
+    font: 11px/1 ui-monospace, Menlo, Consolas, monospace;
+    color: rgba(255,255,255,.6); background: rgba(0,0,0,.25);
+    border: 1px solid rgba(255,255,255,.25); border-radius: 4px;
+    padding: 6px 10px; cursor: pointer;
+  }
+  #cam.on { color: #fff; border-color: rgba(255,255,255,.7); }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="hint">click: new scene / space: pause / s: save</div>
-<script src="main.js"></script>
+<div id="hint">click: new scene / c: camera / space: pause / s: save</div>
+<button id="cam" type="button">camera</button>
+<script type="module" src="main.js"></script>
 </body>
 </html>
