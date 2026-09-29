@@ -1,5 +1,4 @@
-import { ENV_ORDER, MAX_LIGHTS } from './renderer.js';
-import { MAX_SEGS } from './analytic.js';
+import { ENV_ORDER, MAX_LIGHTS, MAX_SEGS } from './renderer.js';
 
 const TAU = Math.PI * 2;
 
@@ -45,24 +44,20 @@ function envCoeffs(base, lobes) {
   return { A: new Float32Array(A.flat()), B: new Float32Array(B.flat()) };
 }
 
-// segs を持たないシーン（カメラ用）では光源をすべて自由浮遊にする
-export function randomScene(seed, aspect, { withSegs = true } = {}) {
+export function randomScene(seed, aspect) {
   const R = mulberry32(seed);
   const pick = (arr) => arr[Math.floor(R() * arr.length)];
 
   const segs = [];
-  if (withSegs) {
-    const n = 5 + Math.floor(R() * 14);
-    let prev = null;
-    for (let i = 0; i < n; i++) {
-      let x, y;
-      if (prev && R() < 0.35) { x = prev.bx; y = prev.by; }
-      else { x = (R() - 0.5) * aspect * 1.15; y = (R() - 0.5) * 1.15; }
-      const a = R() < 0.5 ? Math.floor(R() * 8) * (Math.PI / 4) : R() * TAU;
-      const len = 0.04 + Math.pow(R(), 1.6) * 0.45;
-      prev = { ax: x, ay: y, bx: x + Math.cos(a) * len, by: y + Math.sin(a) * len, ph: R() * 10 };
-      segs.push(prev);
-    }
+  let prev = null;
+  for (let i = 0, n = 5 + Math.floor(R() * 14); i < n; i++) {
+    let x, y;
+    if (prev && R() < 0.35) { x = prev.bx; y = prev.by; }
+    else { x = (R() - 0.5) * aspect * 1.15; y = (R() - 0.5) * 1.15; }
+    const a = R() < 0.5 ? Math.floor(R() * 8) * (Math.PI / 4) : R() * TAU;
+    const len = 0.04 + Math.pow(R(), 1.6) * 0.45;
+    prev = { ax: x, ay: y, bx: x + Math.cos(a) * len, by: y + Math.sin(a) * len, ph: R() * 10 };
+    segs.push(prev);
   }
 
   const b = 0.004 + Math.pow(R(), 2) * 0.09;
@@ -75,7 +70,7 @@ export function randomScene(seed, aspect, { withSegs = true } = {}) {
   const lights = [];
   for (let i = 0, n = 2 + Math.floor(R() * 5); i < n; i++) {
     const l = { r: 0.003 + R() * 0.01, I: 6 + R() * 30, col: pick(PALETTE), ph: R() * 10 };
-    if (segs.length && R() < 0.55) {
+    if (R() < 0.55) {
       // 線分端のすぐ先に置くと、端から扇状に光が回り込む
       l.seg = pick(segs);
       l.end = R() < 0.5;

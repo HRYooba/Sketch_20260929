@@ -1,45 +1,26 @@
-import { createCascadeRenderer } from './renderer.js';
-import { createAnalyticRenderer } from './analytic.js';
+import { createRenderer } from './renderer.js';
 import { randomScene, segsAt, lightsAt } from './scene.js';
-import { Camera } from './camera.js';
-import { DepthEstimator } from './depth.js';
 
-const camButton = document.getElementById('cam');
-const preview = document.getElementById('preview');
-const status = document.getElementById('status');
+const canvas = document.getElementById('c');
 const params = new URLSearchParams(location.search);
 
-// 線分シーンは表示解像度で厳密に解く解析版、カメラ深度の等高線は遮蔽物数に依らない Radiance Cascades で描く。
-// 1 つの canvas に 2 つの WebGL コンテキストは持てないので、canvas を分けて表示を切り替える。
-// scale はフレーム時間に合わせて [min, max] で自動調整する（?res= で固定）
-const FIXED_SCALE = Number(params.get('res')) || 0;
-const modes = {};
+let renderer;
 try {
-  modes.analytic = { canvas: document.getElementById('c'), scale: 1, min: 0.6, max: 1 };
-  modes.analytic.renderer = createAnalyticRenderer(modes.analytic.canvas);
-  modes.cascade = { canvas: document.getElementById('c2'), scale: 0.5, min: 0.35, max: 0.6 };
-  modes.cascade.renderer = createCascadeRenderer(modes.cascade.canvas);
+  renderer = createRenderer(canvas);
 } catch (e) {
   document.body.innerHTML = `<p style="color:#aaa;font:14px sans-serif;padding:2em">${e.message}</p>`;
   throw e;
 }
-if (FIXED_SCALE) Object.values(modes).forEach((m) => { m.scale = FIXED_SCALE; });
 
+// 描画解像度（表示解像度比）。?res= で固定しない限り、フレーム時間に合わせて自動で上下させる
+const FIXED_SCALE = Number(params.get('res')) || 0;
+const SCALE_MIN = 0.6, SCALE_MAX = 1;
+let scale = FIXED_SCALE || 1;
 const aspect = () => innerWidth / innerHeight;
-const resize = (m) => m.renderer.resize(innerWidth, innerHeight, m.scale);
+const resize = () => renderer.resize(innerWidth, innerHeight, scale);
 
-const camera = new Camera(preview);
-const depth = new DepthEstimator();
-let bands = Number(params.get('bands')) || 14;
 let scene;
-// カメラモードは線分を持たない専用シーン（光源と環境光だけ）で、遮蔽物はカメラ深度の等高線だけ。
-// カメラの許可待ち・起動中もこのシーンを出すため、モードはカメラの状態と別に持つ
-let cameraMode = false;
-const active = () => (cameraMode ? modes.cascade : modes.analytic);
-const newSeed = () => (Math.random() * 2 ** 31) | 0;
-function newScene(seed = newSeed()) {
-  scene = randomScene(seed, aspect(), { withSegs: !cameraMode });
-}
+const newScene = (seed = (Math.random() * 2 ** 31) | 0) => { scene = randomScene(seed, aspect()); };
 
 const mouse = { x: 0, y: 0, on: false };
 let paused = false;
@@ -48,101 +29,53 @@ let time = 0;
 let last = performance.now();
 let slowFrames = 0, fastFrames = 0;
 
-function adapt(m, dt) {
+function adapt(dt) {
   if (FIXED_SCALE) return;
   if (dt > 1 / 30) { slowFrames++; fastFrames = 0; }
   else if (dt < 1 / 55) { fastFrames++; slowFrames = 0; }
-  if (slowFrames > 30 && m.scale > m.min) { m.scale = Math.max(m.min, m.scale * 0.85); slowFrames = 0; resize(m); }
-  if (fastFrames > 120 && m.scale < m.max) { m.scale = Math.min(m.max, m.scale * 1.1); fastFrames = 0; resize(m); }
+  if (slowFrames > 30 && scale > SCALE_MIN) { scale = Math.max(SCALE_MIN, scale * 0.85); slowFrames = 0; resize(); }
+  if (fastFrames > 120 && scale < SCALE_MAX) { scale = Math.min(SCALE_MAX, scale * 1.1); fastFrames = 0; resize(); }
 }
 
 function render(now) {
   const dt = Math.min((now - last) / 1000, 0.1);
   last = now;
   if (!paused) time += dt;
-  const m = active();
-  adapt(m, dt);
+  adapt(dt);
 
   const segs = segsAt(scene, time);
   const lights = lightsAt(scene, segs, time);
   if (mouse.on) lights.push({ x: mouse.x, y: mouse.y, r: 0.008, I: 22, col: [1, 0.95, 0.9] });
 
-  const d = cameraMode ? depth.result : null;
-  m.renderer.draw({
+  renderer.draw({
     segs, lights,
-    depth: d, depthLo: depth.lo, depthHi: depth.hi, bands, contourDir: scene.rot0 + time * 0.1,
     env: scene.env, envRot: scene.rot0 + time * 0.03,
     frame,
   });
-
-  if (cameraMode && frame % 30 === 0) {
-    status.textContent = d ? `depth ${depth.device} ${depth.fps.toFixed(1)}fps / bands ${bands}` : 'depth: loading model…';
-  }
 
   frame++;
   requestAnimationFrame(render);
 }
 
-function setCameraMode(on) {
-  cameraMode = on;
-  modes.analytic.canvas.hidden = on;
-  modes.cascade.canvas.hidden = !on;
-  camButton.classList.toggle('on', on);
-  preview.hidden = !on;
-  status.hidden = !on;
-  slowFrames = fastFrames = 0;
-  newScene();
-}
-
-async function toggleCamera() {
-  if (cameraMode) {
-    depth.stop();
-    camera.stop();
-    setCameraMode(false);
-    return;
-  }
-  setCameraMode(true);
-  try {
-    await camera.start();
-  } catch (e) {
-    console.error(e);
-    camera.stop();
-    setCameraMode(false);
-    alert(`カメラを開けませんでした: ${e.message}`);
-    return;
-  }
-  depth.run(camera.video).catch((e) => {
-    console.error(e);
-    status.textContent = `depth: ${e.message}`;
-  });
-}
-
-for (const m of Object.values(modes)) {
-  m.canvas.addEventListener('pointermove', (e) => {
-    if (e.pointerType !== 'mouse') return;
-    mouse.x = (e.clientX / innerWidth - 0.5) * aspect();
-    mouse.y = 0.5 - e.clientY / innerHeight;
-    mouse.on = true;
-  });
-  m.canvas.addEventListener('pointerleave', () => { mouse.on = false; });
-  m.canvas.addEventListener('click', () => newScene());
-}
-camButton.addEventListener('click', toggleCamera);
+canvas.addEventListener('pointermove', (e) => {
+  if (e.pointerType !== 'mouse') return;
+  mouse.x = (e.clientX / innerWidth - 0.5) * aspect();
+  mouse.y = 0.5 - e.clientY / innerHeight;
+  mouse.on = true;
+});
+canvas.addEventListener('pointerleave', () => { mouse.on = false; });
+canvas.addEventListener('click', () => newScene());
 addEventListener('keydown', (e) => {
   if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
-  if (e.code === 'KeyC') toggleCamera();
-  if (e.code === 'BracketLeft') bands = Math.max(2, bands - 2);
-  if (e.code === 'BracketRight') bands = Math.min(60, bands + 2);
   if (e.code === 'KeyS') {
     const a = document.createElement('a');
     a.download = `gi-${Date.now()}.png`;
-    a.href = active().canvas.toDataURL('image/png');
+    a.href = canvas.toDataURL('image/png');
     a.click();
   }
 });
-addEventListener('resize', () => Object.values(modes).forEach(resize));
+addEventListener('resize', resize);
 
-Object.values(modes).forEach(resize);
+resize();
 newScene(params.get('seed') ? Number(params.get('seed')) : undefined);
-if (params.has('camera')) toggleCamera();
 requestAnimationFrame(render);
